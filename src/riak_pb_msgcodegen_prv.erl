@@ -69,7 +69,7 @@ csv_to_tuples(String) ->
     Lines = string:tokens(String, [$\r,$\n]),
     [ begin
           [Code, Message, Proto] = string:tokens(Line, ","),
-          {list_to_integer(Code), string:to_lower(Message), Proto ++ "_pb"}
+          {list_to_integer(Code), Message, Proto ++ "_pb"}
       end
      || Line <- Lines].
 
