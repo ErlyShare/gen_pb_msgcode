@@ -33,18 +33,66 @@ do(State) ->
     end,
     [begin
         Opts = rebar_app_info:opts(AppInfo),
-        SourceDir = filename:join(rebar_app_info:dir(AppInfo), "src"),
-        IncludeDir = filename:join(rebar_app_info:dir(AppInfo), "include"),
-        FoundFiles = rebar_utils:find_files(SourceDir, ".*\\.csv\$"),
+        AppDir = rebar_app_info:dir(AppInfo),
 
-        CompileFun = fun(Source, _Opts1) ->
-            ModName = filename:basename(Source, ".csv"),
-            TargetName = ModName ++ ".erl",
-            Hrl = ModName ++ ".hrl",
-            generate(Source, filename:join(SourceDir, TargetName), filename:join(IncludeDir, Hrl))
+        {ok, PbMessageOpts} = dict:find(pb_message, Opts),
+
+        CsvDirList = proplists:get_all_values(i, PbMessageOpts),
+        ModuleName = proplists:get_value(module_name, PbMessageOpts),
+        SourceDir = filename:join(AppDir, "src"),
+        IncludeDir = filename:join(AppDir, "include"),
+
+        CsvFileList = lists:sort(lists:foldl(
+            fun(CsvFile, Acc) -> Acc ++ discover(AppDir, CsvFile) end,
+            [], CsvDirList
+        )),
+
+
+
+        CompileFun = fun(Source, {HrlCodeStr, DecoderStr, MsgCode, MsgType}) ->
+            {RHrlCodeStr, RDecoderStr, RMsgCode, RMsgType} = generate(Source),
+            {
+                HrlCodeStr ++ RHrlCodeStr,
+                DecoderStr ++ RDecoderStr,
+                MsgCode ++ RMsgCode,
+                MsgType ++ RMsgType
+            }
         end,
 
-        rebar_base_compiler:run(Opts, [], FoundFiles, CompileFun)
+        {HrlCodeStr1, DecoderStr1, MsgCode1, MsgType1} = lists:foldl(CompileFun, {"", [], [], []}, CsvFileList),
+%%        rebar_api:info("SrcString ~p~n", [SrcString]),
+
+        %% TODO: Add generated doc comment at the top
+        Module = erl_syntax:attribute(erl_syntax:atom(module),
+            [erl_syntax:atom(ModuleName)]),
+        ExportsList = [
+            erl_syntax:arity_qualifier(erl_syntax:atom(Fun), erl_syntax:integer(1))
+            || Fun <- [msg_type, msg_code, decoder_for] ],
+
+        Exports = erl_syntax:attribute(erl_syntax:atom(export),
+            [erl_syntax:list(ExportsList)]),
+
+        CatchAll = erl_syntax:clause([erl_syntax:underscore()], none, [erl_syntax:atom(undefined)]),
+
+        MsgTypeSpec = erl_syntax:text("-spec msg_type(non_neg_integer()) -> atom()."),
+        MsgTyeName = erl_syntax:atom(msg_type),
+        FunMsgType = [MsgTypeSpec, erl_syntax:function(MsgTyeName, MsgType1 ++ [CatchAll]) ],
+
+        MsgCodeSpec = erl_syntax:text("-spec msg_code(atom()) -> non_neg_integer()."),
+        MsgCodeName = erl_syntax:atom(msg_code),
+        FunMsgCode = [MsgCodeSpec, erl_syntax:function(MsgCodeName, MsgCode1 ++ [CatchAll]) ],
+
+        DecoderSpec = erl_syntax:text("-spec decoder_for(non_neg_integer()) -> module().\n"),
+        DecoderName = erl_syntax:atom(decoder_for),
+        FunDecoder = [DecoderSpec, erl_syntax:function(DecoderName, DecoderStr1 ++ [CatchAll]) ],
+
+        CodeString = FunMsgType ++ FunMsgCode ++ FunDecoder,
+
+        ModuleStr = erl_syntax:form_list([Module, Exports|CodeString]),
+        Formatted = erl_prettypr:format(ModuleStr),
+        ok = file:write_file(filename:join(SourceDir, ModuleName ++ ".erl"), Formatted),
+        ok = file:write_file(filename:join(IncludeDir, ModuleName ++ ".hrl"), HrlCodeStr1),
+        rebar_api:info("pb_message generate ok.~n", [])
     end || AppInfo <- Apps],
 
     {ok, State}.
@@ -55,15 +103,14 @@ format_error(Reason) ->
 
 %%
 
-generate(CSV, Erl, Hrl) ->
+generate(CSV) ->
     Tuples = load_csv(CSV),
-    ModName = filename:basename(CSV, ".csv"),
-    Module = generate_module(ModName, Tuples),
-    HrlCode = generate_hrl(Tuples),
-    Formatted = erl_prettypr:format(Module),
-    ok = file:write_file(Erl, Formatted),
-    ok = file:write_file(Hrl, HrlCode),
-    rebar_api:info("Generated ~s~n", [Erl]).
+    {
+        generate_hrl(Tuples),
+        generate_decoder_for(Tuples),
+        generate_msg_code(Tuples),
+        generate_msg_type(Tuples)
+    }.
 
 load_csv(SourceFile) ->
     {ok, Bin} = file:read_file(SourceFile),
@@ -86,51 +133,17 @@ generate_hrl(Tuples) ->
     lists:foldl(Fun, "", Tuples).
 
 
-
-
-generate_module(Name, Tuples) ->
-    %% TODO: Add generated doc comment at the top
-    Mod = erl_syntax:attribute(erl_syntax:atom(module),
-        [erl_syntax:atom(Name)]),
-    ExportsList = [
-        erl_syntax:arity_qualifier(erl_syntax:atom(Fun), erl_syntax:integer(1))
-        || Fun <- [msg_type, msg_code, decoder_for] ],
-
-    Exports = erl_syntax:attribute(erl_syntax:atom(export),
-        [erl_syntax:list(ExportsList)]),
-
-    Clauses = generate_msg_type(Tuples) ++
-        generate_msg_code(Tuples) ++
-        generate_decoder_for(Tuples),
-
-    erl_syntax:form_list([Mod, Exports|Clauses]).
-
 generate_decoder_for(Tuples) ->
-    Spec = erl_syntax:text("-spec decoder_for(non_neg_integer()) -> module().\n"),
-    Name = erl_syntax:atom(decoder_for),
-    Clauses = [
-        erl_syntax:clause([erl_syntax:integer(Code)],
-            none,
-            [erl_syntax:atom(Mod)])
-        || {Code, _, Mod} <- Tuples ],
-    [ Spec, erl_syntax:function(Name, Clauses) ].
+    [erl_syntax:clause([erl_syntax:integer(Code)], none, [erl_syntax:atom(Mod)])
+        || {Code, _, Mod} <- Tuples ].
 
 generate_msg_code(Tuples) ->
-    Spec = erl_syntax:text("-spec msg_code(atom()) -> non_neg_integer()."),
-    Name = erl_syntax:atom(msg_code),
-    Clauses = [
-        erl_syntax:clause([erl_syntax:atom(Msg)], none, [erl_syntax:integer(Code)])
-        || {Code, Msg, _} <- Tuples ],
-    [ Spec, erl_syntax:function(Name, Clauses) ].
+    [erl_syntax:clause([erl_syntax:atom(Msg)], none, [erl_syntax:integer(Code)])
+        || {Code, Msg, _} <- Tuples ].
 
 generate_msg_type(Tuples) ->
-    Spec = erl_syntax:text("-spec msg_type(non_neg_integer()) -> atom()."),
-    Name = erl_syntax:atom(msg_type),
-    Clauses = [
-        erl_syntax:clause([erl_syntax:integer(Code)], none, [erl_syntax:atom(Msg)])
-        || {Code, Msg, _} <- Tuples ],
-    CatchAll = erl_syntax:clause([erl_syntax:underscore()], none, [erl_syntax:atom(undefined)]),
-    [ Spec, erl_syntax:function(Name, Clauses ++ [CatchAll]) ].
+    [erl_syntax:clause([erl_syntax:integer(Code)], none, [erl_syntax:atom(Msg)])
+        || {Code, Msg, _} <- Tuples ].
 
 change_msg(Msg) ->
     Fun = fun(Chr, Str) ->
@@ -144,6 +157,14 @@ change_msg(Msg) ->
     end,
     lists:foldl(Fun, "", Msg).
 
+
+
+discover(AppDir, SourceDir) ->
+    %% Convert simple extension to proper regex
+    SourceExtRe = "^[^._].*\\" ++ ".csv" ++ [$$],
+    %% Find all possible source files
+    rebar_utils:find_files(filename:join([AppDir, SourceDir]),
+        SourceExtRe, true).
 
 -spec char_to_lower(char()) -> char().
 char_to_lower($A) -> $a;
